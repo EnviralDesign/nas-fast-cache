@@ -102,6 +102,23 @@ scripts\install-service.ps1 `
   -NssmPath 'C:\path\to\nssm.exe'
 ```
 
+By default, NSSM installs services as LocalSystem. That is only suitable when the
+configured `$SourceRoot` is readable by LocalSystem. If the source UNC path relies
+on your Windows user's stored SMB credentials, configure the service to run as
+that Windows user instead:
+
+```powershell
+scripts\install-service.ps1 `
+  -ServiceName NasFastCache `
+  -ConfigPath config\local.ps1 `
+  -NssmPath 'C:\path\to\nssm.exe' `
+  -ServiceUser '.\your-user' `
+  -ServicePassword '<your-windows-password>'
+```
+
+The installer configures automatic startup, process restart on exit, and rotating
+stdout/stderr logs under `logs/`.
+
 Inspect the exact commands without changing anything:
 
 ```powershell

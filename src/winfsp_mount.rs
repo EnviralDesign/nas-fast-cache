@@ -11,6 +11,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use windows::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+use windows::core::PCWSTR;
 use winfsp::filesystem::{
     DirBuffer, DirInfo, DirMarker, FileInfo, FileSecurity, FileSystemContext, OpenFileInfo,
     VolumeInfo, WideNameInfo,
@@ -69,7 +71,7 @@ pub fn mount_with_options(
         .read_only_volume(!mount_options.enable_writes)
         .file_info_timeout(u32::MAX)
         .dir_info_timeout(u32::MAX)
-        .volume_info_timeout(u32::MAX)
+        .volume_info_timeout(30_000)
         .security_timeout(u32::MAX)
         .post_cleanup_when_modified_only(true)
         .flush_and_purge_on_cleanup(true);
@@ -1227,11 +1229,39 @@ impl FileSystemContext for ReadThroughFs {
     }
 
     fn get_volume_info(&self, out_volume_info: &mut VolumeInfo) -> FspResult<()> {
-        out_volume_info.total_size = 16 * 1024_u64.pow(4);
-        out_volume_info.free_size = 8 * 1024_u64.pow(4);
+        let source_root = &self.cache.config().source_root;
+        match get_disk_free_space_ex(source_root) {
+            Ok((total_size, free_size)) => {
+                out_volume_info.total_size = total_size;
+                out_volume_info.free_size = free_size;
+            }
+            Err(_) => {
+                out_volume_info.total_size =
+                    fs2::total_space(source_root).unwrap_or_else(|_| 16 * 1024_u64.pow(4));
+                out_volume_info.free_size =
+                    fs2::available_space(source_root).unwrap_or_else(|_| 8 * 1024_u64.pow(4));
+            }
+        }
         out_volume_info.set_volume_label("NasCache");
         Ok(())
     }
+}
+
+fn get_disk_free_space_ex(path: &Path) -> std::io::Result<(u64, u64)> {
+    let wide_path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let mut available_to_caller = 0u64;
+    let mut total = 0u64;
+    let mut free = 0u64;
+    unsafe {
+        GetDiskFreeSpaceExW(
+            PCWSTR(wide_path.as_ptr()),
+            Some(&mut available_to_caller),
+            Some(&mut total),
+            Some(&mut free),
+        )
+        .map_err(Error::other)?;
+    }
+    Ok((total, available_to_caller))
 }
 
 fn path_from_winfsp(file_name: &U16CStr) -> FspResult<PathBuf> {

@@ -33,7 +33,7 @@ optional = true
 
 [dependencies.windows]
 version = "0.61.1"
-features = ["Win32_Foundation"]
+features = ["Win32_Foundation", "Win32_Storage_FileSystem"]
 optional = true
 
 [build-dependencies]
