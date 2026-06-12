@@ -1,0 +1,22 @@
+# Copy this file to config/local.ps1 and edit for the local machine.
+# config/local.ps1 is ignored by git.
+
+$SourceRoot = "\\nas-host\share"
+$CacheRoot = "C:\path\to\nas-fast-cache"
+$Mount = "W:"
+
+$Threads = 8
+$ChunkSizeMiB = 8
+$StatsSeconds = 0
+
+$DisableCacheWrites = $false
+$EnableSequentialConveyor = $true
+
+# Writes are opt-in. Leave disabled unless you need a bidirectional mount.
+$EnableWrites = $false
+# Use a subdirectory for scoped writes, or "." to explicitly allow full-tree
+# writes when this is intended to replace a normal mapped share.
+$WritePrefix = ""
+$ReuseWriteHandles = $false
+
+$WinFspBin = "C:\Program Files (x86)\WinFsp\bin"

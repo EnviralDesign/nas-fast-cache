@@ -1,0 +1,13 @@
+/target/
+
+# Local machine/NAS settings. Copy config/local.ps1.example to this name.
+/config/local.ps1
+
+# Runtime logs from helper scripts.
+/logs/
+
+# Large local cache roots should live outside the repo, but ignore common
+# accidental in-repo cache directories defensively.
+/cache/
+/nas-cache/
+/nas-fast-cache-data/

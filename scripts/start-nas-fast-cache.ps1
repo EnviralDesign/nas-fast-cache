@@ -1,0 +1,93 @@
+param(
+    [string]$ConfigPath = "",
+    [string]$SourceRoot = "",
+    [string]$CacheRoot = "",
+    [string]$Mount = "",
+    [string]$WinFspBin = "",
+    [int]$Threads = 0,
+    [int]$ChunkSizeMiB = 0,
+    [int]$StatsSeconds = 0,
+    [switch]$DisableCacheWrites,
+    [switch]$EnableSequentialConveyor,
+    [switch]$EnableWrites,
+    [string]$WritePrefix = "",
+    [switch]$ReuseWriteHandles,
+    [switch]$Background
+)
+
+$ErrorActionPreference = "Stop"
+$repoRoot = Split-Path -Parent $PSScriptRoot
+
+if ($ConfigPath) {
+    $resolvedConfig = if ([System.IO.Path]::IsPathRooted($ConfigPath)) {
+        $ConfigPath
+    } else {
+        Join-Path $repoRoot $ConfigPath
+    }
+    if (-not (Test-Path $resolvedConfig)) {
+        throw "Config file not found: $resolvedConfig"
+    }
+    . $resolvedConfig
+} else {
+    $defaultConfig = Join-Path $repoRoot "config\local.ps1"
+    if (Test-Path $defaultConfig) {
+        . $defaultConfig
+    }
+}
+
+if (-not $SourceRoot) { $SourceRoot = $env:NAS_FAST_CACHE_SOURCE_ROOT }
+if (-not $CacheRoot) { $CacheRoot = $env:NAS_FAST_CACHE_CACHE_ROOT }
+if (-not $Mount) { $Mount = $env:NAS_FAST_CACHE_MOUNT }
+if (-not $WinFspBin) { $WinFspBin = $env:NAS_FAST_CACHE_WINFSP_BIN }
+if (-not $WinFspBin) { $WinFspBin = "C:\Program Files (x86)\WinFsp\bin" }
+if (-not $Threads) { $Threads = 8 }
+if (-not $ChunkSizeMiB) { $ChunkSizeMiB = 8 }
+
+if (-not $SourceRoot) { throw "SourceRoot is required. Use -SourceRoot, config/local.ps1, or NAS_FAST_CACHE_SOURCE_ROOT." }
+if (-not $CacheRoot) { throw "CacheRoot is required. Use -CacheRoot, config/local.ps1, or NAS_FAST_CACHE_CACHE_ROOT." }
+if (-not $Mount) { throw "Mount is required. Use -Mount, config/local.ps1, or NAS_FAST_CACHE_MOUNT." }
+if ($EnableWrites -and -not $WritePrefix) {
+    throw "-EnableWrites requires -WritePrefix to keep write scope explicit."
+}
+
+$exe = Join-Path $repoRoot "target\release\nas-fast-cache.exe"
+if (-not (Test-Path $exe)) {
+    throw "nas-fast-cache.exe not found. Build it with: cargo build --release"
+}
+if (-not (Test-Path $WinFspBin)) {
+    throw "WinFsp bin path not found: $WinFspBin"
+}
+
+New-Item -ItemType Directory -Force $CacheRoot | Out-Null
+
+$args = @(
+    "mount",
+    "--source-root", $SourceRoot,
+    "--cache-root", $CacheRoot,
+    "--mount", $Mount,
+    "--threads", "$Threads",
+    "--chunk-size-mib", "$ChunkSizeMiB"
+)
+if ($DisableCacheWrites) { $args += "--disable-cache-writes" }
+if ($EnableSequentialConveyor) { $args += "--enable-sequential-conveyor" }
+if ($EnableWrites) {
+    $args += "--enable-writes"
+    $args += "--write-prefix"
+    $args += $WritePrefix
+}
+if ($ReuseWriteHandles) { $args += "--reuse-write-handles" }
+
+if ($Background) {
+    $logDir = Join-Path $repoRoot "logs"
+    New-Item -ItemType Directory -Force $logDir | Out-Null
+    $log = Join-Path $logDir "nas-fast-cache-$($Mount.TrimEnd(':'))-mount.log"
+    $encodedArgs = ($args | ForEach-Object { "'$($_.Replace("'", "''"))'" }) -join " "
+    $cmd = "`$env:PATH = '$WinFspBin;' + `$env:PATH; `$env:NAS_CACHE_STATS_SECONDS = '$StatsSeconds'; & '$exe' $encodedArgs *> '$log'"
+    $process = Start-Process -FilePath "powershell.exe" -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", $cmd) -WindowStyle Hidden -PassThru
+    "started wrapper_pid=$($process.Id) mount=$Mount log=$log"
+    return
+}
+
+$env:PATH = "$WinFspBin;$env:PATH"
+$env:NAS_CACHE_STATS_SECONDS = "$StatsSeconds"
+& $exe @args
