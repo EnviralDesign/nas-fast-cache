@@ -4,8 +4,8 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use anyhow::{Result, bail};
-use clap::{Parser, Subcommand};
-use nas_cache::cache::{CacheConfig, CacheIoStats, ReadThroughCache};
+use clap::{Args, Parser, Subcommand};
+use nas_cache::cache::{CacheConfig, CacheIoStats, ReadThroughCache, prune_config};
 use nas_cache::pathing::relative_input;
 
 #[derive(Debug, Parser)]
@@ -37,6 +37,8 @@ enum Command {
         disable_cache_writes: bool,
         #[arg(long)]
         enable_sequential_conveyor: bool,
+        #[command(flatten)]
+        cache_policy: CachePolicyArgs,
     },
     Read {
         #[arg(long)]
@@ -57,6 +59,8 @@ enum Command {
         disable_cache_writes: bool,
         #[arg(long)]
         enable_sequential_conveyor: bool,
+        #[command(flatten)]
+        cache_policy: CachePolicyArgs,
     },
     Stat {
         #[arg(long)]
@@ -99,7 +103,29 @@ enum Command {
         write_prefix: Option<PathBuf>,
         #[arg(long)]
         reuse_write_handles: bool,
+        #[command(flatten)]
+        cache_policy: CachePolicyArgs,
     },
+    Prune {
+        #[arg(long)]
+        cache_root: PathBuf,
+        #[command(flatten)]
+        cache_policy: CachePolicyArgs,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Default, Args)]
+struct CachePolicyArgs {
+    #[arg(long)]
+    max_cache_gb: Option<f64>,
+    #[arg(long)]
+    max_age_hours: Option<f64>,
+    #[arg(long)]
+    min_free_gb: Option<f64>,
+    #[arg(long, default_value_t = 0.0)]
+    min_eviction_age_hours: f64,
+    #[arg(long, default_value_t = 300)]
+    prune_interval_seconds: u64,
 }
 
 fn main() -> Result<()> {
@@ -115,6 +141,7 @@ fn main() -> Result<()> {
             offset_mib,
             disable_cache_writes,
             enable_sequential_conveyor,
+            cache_policy,
         } => {
             let cache = cache(
                 source_root,
@@ -122,6 +149,7 @@ fn main() -> Result<()> {
                 chunk_size_mib,
                 !disable_cache_writes,
                 enable_sequential_conveyor,
+                cache_policy,
             )?;
             let rel = relative_input(&cache.config().source_root, path)?;
             let limit = limit_mib.map(mib);
@@ -148,6 +176,7 @@ fn main() -> Result<()> {
             offset_mib,
             disable_cache_writes,
             enable_sequential_conveyor,
+            cache_policy,
         } => {
             let cache = cache(
                 source_root,
@@ -155,6 +184,7 @@ fn main() -> Result<()> {
                 chunk_size_mib,
                 !disable_cache_writes,
                 enable_sequential_conveyor,
+                cache_policy,
             )?;
             let rel = relative_input(&cache.config().source_root, path)?;
             let mut writer: Box<dyn Write> = match out {
@@ -178,7 +208,14 @@ fn main() -> Result<()> {
             path,
             chunk_size_mib,
         } => {
-            let cache = cache(source_root, cache_root, chunk_size_mib, true, false)?;
+            let cache = cache(
+                source_root,
+                cache_root,
+                chunk_size_mib,
+                true,
+                false,
+                CachePolicyArgs::default(),
+            )?;
             let rel = relative_input(&cache.config().source_root, path)?;
             let stat = cache.stat(&rel)?;
             println!("{}", serde_json::to_string_pretty(&stat)?);
@@ -189,7 +226,14 @@ fn main() -> Result<()> {
             path,
             chunk_size_mib,
         } => {
-            let cache = cache(source_root, cache_root, chunk_size_mib, true, false)?;
+            let cache = cache(
+                source_root,
+                cache_root,
+                chunk_size_mib,
+                true,
+                false,
+                CachePolicyArgs::default(),
+            )?;
             let rel = relative_input(&cache.config().source_root, path)?;
             let removed = cache.evict_file(&rel)?;
             println!("removed_bytes={removed}");
@@ -205,6 +249,7 @@ fn main() -> Result<()> {
             enable_writes,
             write_prefix,
             reuse_write_handles,
+            cache_policy,
         } => mount(
             source_root,
             cache_root,
@@ -216,7 +261,17 @@ fn main() -> Result<()> {
             enable_writes,
             write_prefix,
             reuse_write_handles,
+            cache_policy,
         )?,
+        Command::Prune {
+            cache_root,
+            cache_policy,
+        } => {
+            let mut config = CacheConfig::new(PathBuf::new(), cache_root);
+            apply_cache_policy(&mut config, cache_policy)?;
+            let summary = prune_config(&config)?;
+            println!("{}", serde_json::to_string_pretty(&summary_json(summary))?);
+        }
     }
     Ok(())
 }
@@ -227,6 +282,7 @@ fn cache(
     chunk_size_mib: u64,
     write_cache: bool,
     enable_sequential_conveyor: bool,
+    cache_policy: CachePolicyArgs,
 ) -> Result<ReadThroughCache> {
     if chunk_size_mib == 0 {
         bail!("chunk size must be greater than zero");
@@ -235,7 +291,44 @@ fn cache(
     config.chunk_size = mib(chunk_size_mib);
     config.write_cache = write_cache;
     config.enable_sequential_conveyor = enable_sequential_conveyor;
+    apply_cache_policy(&mut config, cache_policy)?;
     Ok(ReadThroughCache::new(config))
+}
+
+fn apply_cache_policy(config: &mut CacheConfig, policy: CachePolicyArgs) -> Result<()> {
+    config.max_cache_bytes = policy
+        .max_cache_gb
+        .map(|value| bytes_from_gb(value, "max-cache-gb"))
+        .transpose()?;
+    config.max_cache_age = policy
+        .max_age_hours
+        .map(|value| duration_from_hours(value, "max-age-hours"))
+        .transpose()?;
+    config.min_free_bytes = policy
+        .min_free_gb
+        .map(|value| bytes_from_gb(value, "min-free-gb"))
+        .transpose()?;
+    config.min_eviction_age =
+        duration_from_hours(policy.min_eviction_age_hours, "min-eviction-age-hours")?;
+    if policy.prune_interval_seconds == 0 {
+        bail!("prune interval must be greater than zero");
+    }
+    config.prune_interval = std::time::Duration::from_secs(policy.prune_interval_seconds);
+    Ok(())
+}
+
+fn bytes_from_gb(value: f64, name: &str) -> Result<u64> {
+    if !value.is_finite() || value <= 0.0 {
+        bail!("{name} must be greater than zero");
+    }
+    Ok((value * 1024.0 * 1024.0 * 1024.0).round() as u64)
+}
+
+fn duration_from_hours(value: f64, name: &str) -> Result<std::time::Duration> {
+    if !value.is_finite() || value < 0.0 {
+        bail!("{name} must be zero or greater");
+    }
+    Ok(std::time::Duration::from_secs_f64(value * 3600.0))
 }
 
 fn mib(value: u64) -> u64 {
@@ -295,6 +388,7 @@ fn mount(
     enable_writes: bool,
     write_prefix: Option<PathBuf>,
     reuse_write_handles: bool,
+    cache_policy: CachePolicyArgs,
 ) -> Result<()> {
     use nas_cache::pathing::normalize_relative_path;
     use nas_cache::winfsp_mount::{MountOptions, mount_with_options};
@@ -312,6 +406,7 @@ fn mount(
         chunk_size_mib,
         write_cache,
         enable_sequential_conveyor,
+        cache_policy,
     )?;
     mount_with_options(
         cache,
@@ -338,6 +433,21 @@ fn mount(
     _enable_writes: bool,
     _write_prefix: Option<PathBuf>,
     _reuse_write_handles: bool,
+    _cache_policy: CachePolicyArgs,
 ) -> Result<()> {
     bail!("mount support is only available on Windows with the `mount` feature enabled")
+}
+
+fn summary_json(summary: nas_cache::cache::PruneSummary) -> serde_json::Value {
+    serde_json::json!({
+        "removed_entries": summary.removed_entries,
+        "removed_bytes": summary.removed_bytes,
+        "removed_gb": summary.removed_bytes as f64 / 1024.0 / 1024.0 / 1024.0,
+        "cache_bytes_before": summary.cache_bytes_before,
+        "cache_bytes_after": summary.cache_bytes_after,
+        "cache_gb_before": summary.cache_bytes_before as f64 / 1024.0 / 1024.0 / 1024.0,
+        "cache_gb_after": summary.cache_bytes_after as f64 / 1024.0 / 1024.0 / 1024.0,
+        "free_bytes_before": summary.free_bytes_before,
+        "free_bytes_after": summary.free_bytes_after,
+    })
 }

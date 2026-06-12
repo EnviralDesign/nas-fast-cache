@@ -6,6 +6,11 @@ param(
     [string]$WinFspBin = "",
     [int]$Threads = 0,
     [int]$ChunkSizeMiB = 0,
+    [double]$MaxCacheGB = 0,
+    [double]$MaxAgeHours = 0,
+    [double]$MinFreeGB = 0,
+    [double]$MinEvictionAgeHours = 0,
+    [int]$PruneIntervalSeconds = 0,
     [int]$StatsSeconds = 0,
     [switch]$DisableCacheWrites,
     [switch]$EnableSequentialConveyor,
@@ -50,6 +55,7 @@ if (-not $WinFspBin) { $WinFspBin = $env:NAS_FAST_CACHE_WINFSP_BIN }
 if (-not $WinFspBin) { $WinFspBin = "C:\Program Files (x86)\WinFsp\bin" }
 if (-not $Threads) { $Threads = 8 }
 if (-not $ChunkSizeMiB) { $ChunkSizeMiB = 8 }
+if (-not $PruneIntervalSeconds) { $PruneIntervalSeconds = 300 }
 
 if (-not $SourceRoot) { throw "SourceRoot is required. Use -SourceRoot, config/local.ps1, or NAS_FAST_CACHE_SOURCE_ROOT." }
 if (-not $CacheRoot) { throw "CacheRoot is required. Use -CacheRoot, config/local.ps1, or NAS_FAST_CACHE_CACHE_ROOT." }
@@ -78,6 +84,24 @@ $args = @(
 )
 if ($DisableCacheWrites) { $args += "--disable-cache-writes" }
 if ($EnableSequentialConveyor) { $args += "--enable-sequential-conveyor" }
+if ($MaxCacheGB -gt 0) {
+    $args += "--max-cache-gb"
+    $args += "$MaxCacheGB"
+}
+if ($MaxAgeHours -gt 0) {
+    $args += "--max-age-hours"
+    $args += "$MaxAgeHours"
+}
+if ($MinFreeGB -gt 0) {
+    $args += "--min-free-gb"
+    $args += "$MinFreeGB"
+}
+if ($MinEvictionAgeHours -gt 0) {
+    $args += "--min-eviction-age-hours"
+    $args += "$MinEvictionAgeHours"
+}
+$args += "--prune-interval-seconds"
+$args += "$PruneIntervalSeconds"
 if ($EnableWrites) {
     $args += "--enable-writes"
     $args += "--write-prefix"

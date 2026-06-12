@@ -51,6 +51,13 @@ Optional values:
 
 - `$Threads`: WinFsp dispatcher threads. `8` is a good starting point.
 - `$ChunkSizeMiB`: source/cache chunk size. `8` is the current default.
+- `$MaxCacheGB`: prune oldest eligible cache groups when cache exceeds this size.
+- `$MaxAgeHours`: prune cache groups older than this access age.
+- `$MinFreeGB`: prune oldest eligible cache groups when the cache drive has less
+  than this much free space.
+- `$MinEvictionAgeHours`: protect recently accessed cache groups from automatic
+  size/free-space pruning. `24` is a conservative starting point.
+- `$PruneIntervalSeconds`: janitor wake interval. `300` gives a 5-minute cadence.
 - `$EnableSequentialConveyor`: enables sequential read prefetching.
 - `$EnableWrites`: enables writes through the mount.
 - `$WritePrefix`: required when writes are enabled; set a subdirectory for scoped
@@ -148,6 +155,34 @@ Chunks are stored under:
 The cache key includes source path, source file size, source modified time, and
 chunk size. If a source file changes, the cache naturally moves to a different
 key.
+
+## Pruning Policy
+
+Automatic pruning is enabled when at least one of these policies is configured:
+
+- `MaxCacheGB`: when cached chunks exceed this size, delete oldest eligible cache
+  groups until the cache is back under the limit.
+- `MaxAgeHours`: delete cache groups whose last access marker is older than this
+  age.
+- `MinFreeGB`: when the cache drive drops below this free-space threshold, delete
+  oldest eligible cache groups until free space is back above the threshold.
+
+Eviction happens at the source-file cache group level, not individual chunks.
+Size and free-space pruning respect `MinEvictionAgeHours`, which protects very
+recently accessed cache groups from being immediately evicted under normal
+pressure. Age pruning uses the older of `MaxAgeHours` and `MinEvictionAgeHours`.
+
+The janitor wakes every `PruneIntervalSeconds` and is also nudged after cache
+chunk writes. Manual pruning is available without mounting:
+
+```powershell
+target\release\nas-fast-cache.exe prune `
+  --cache-root 'C:\path\to\local-cache' `
+  --max-cache-gb 200 `
+  --max-age-hours 120 `
+  --min-free-gb 100 `
+  --min-eviction-age-hours 24
+```
 
 ## Safety Notes
 

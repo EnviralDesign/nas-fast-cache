@@ -9,6 +9,13 @@ $Threads = 8
 $ChunkSizeMiB = 8
 $StatsSeconds = 0
 
+# Cache pruning is opt-in. Values of 0 disable that policy.
+$MaxCacheGB = 0
+$MaxAgeHours = 0
+$MinFreeGB = 0
+$MinEvictionAgeHours = 24
+$PruneIntervalSeconds = 300
+
 $DisableCacheWrites = $false
 $EnableSequentialConveyor = $true
 

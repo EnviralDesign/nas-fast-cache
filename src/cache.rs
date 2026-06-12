@@ -4,7 +4,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(windows)]
 use std::os::windows::fs::OpenOptionsExt;
@@ -22,6 +22,10 @@ const FILE_SHARE_READ_WRITE_DELETE: u32 = 0x0000_0001 | 0x0000_0002 | 0x0000_000
 const PREFETCH_LOOKAHEAD_CHUNKS: u64 = 2;
 const MAX_PREFETCH_IN_FLIGHT: usize = 2;
 const MAX_PREFETCH_READY_CHUNKS: usize = 4;
+const DEFAULT_PRUNE_INTERVAL: Duration = Duration::from_secs(300);
+const DEFAULT_MIN_EVICTION_AGE: Duration = Duration::from_secs(0);
+const ACCESS_TOUCH_INTERVAL: Duration = Duration::from_secs(60);
+const MIN_PRUNE_REQUEST_INTERVAL: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Error)]
 pub enum CacheError {
@@ -44,6 +48,11 @@ pub struct CacheConfig {
     pub chunk_size: u64,
     pub write_cache: bool,
     pub enable_sequential_conveyor: bool,
+    pub max_cache_bytes: Option<u64>,
+    pub max_cache_age: Option<Duration>,
+    pub min_free_bytes: Option<u64>,
+    pub min_eviction_age: Duration,
+    pub prune_interval: Duration,
 }
 
 impl CacheConfig {
@@ -54,7 +63,18 @@ impl CacheConfig {
             chunk_size: DEFAULT_CHUNK_SIZE,
             write_cache: true,
             enable_sequential_conveyor: false,
+            max_cache_bytes: None,
+            max_cache_age: None,
+            min_free_bytes: None,
+            min_eviction_age: DEFAULT_MIN_EVICTION_AGE,
+            prune_interval: DEFAULT_PRUNE_INTERVAL,
         }
+    }
+
+    fn pruning_enabled(&self) -> bool {
+        self.max_cache_bytes.is_some()
+            || self.max_cache_age.is_some()
+            || self.min_free_bytes.is_some()
     }
 }
 
@@ -131,6 +151,79 @@ pub struct CacheReadWindow {
     sequential_reads: u32,
     conveyor: SequentialConveyor,
     source_file: Option<WindowSourceFile>,
+}
+
+#[derive(Default)]
+struct CacheRuntimeState {
+    access_touches: Mutex<HashMap<String, Instant>>,
+}
+
+#[derive(Clone)]
+struct CacheMaintainer {
+    tx: Option<Sender<()>>,
+}
+
+impl CacheMaintainer {
+    fn new(config: CacheConfig) -> Self {
+        if !config.pruning_enabled() {
+            return Self { tx: None };
+        }
+
+        let (tx, rx) = mpsc::channel::<()>();
+        std::thread::Builder::new()
+            .name("nas-fast-cache-janitor".to_string())
+            .spawn(move || {
+                run_cache_maintainer(config, rx);
+            })
+            .expect("failed to spawn nas-fast-cache janitor");
+        Self { tx: Some(tx) }
+    }
+
+    fn request(&self) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(());
+        }
+    }
+}
+
+fn run_cache_maintainer(config: CacheConfig, rx: Receiver<()>) {
+    let mut last_prune = Instant::now()
+        .checked_sub(config.prune_interval)
+        .unwrap_or_else(Instant::now);
+    loop {
+        let wait = config
+            .prune_interval
+            .checked_sub(last_prune.elapsed())
+            .unwrap_or(Duration::ZERO);
+        match rx.recv_timeout(wait) {
+            Ok(()) => {}
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+
+        if last_prune.elapsed() < MIN_PRUNE_REQUEST_INTERVAL {
+            continue;
+        }
+
+        match prune_cache(&config) {
+            Ok(summary) if summary.removed_entries > 0 => {
+                eprintln!(
+                    "nas-fast-cache janitor removed_entries={} removed_mib={:.2} cache_mib_before={:.2} cache_mib_after={:.2} free_gb_before={:.2} free_gb_after={:.2}",
+                    summary.removed_entries,
+                    summary.removed_bytes as f64 / 1024.0 / 1024.0,
+                    summary.cache_bytes_before as f64 / 1024.0 / 1024.0,
+                    summary.cache_bytes_after as f64 / 1024.0 / 1024.0,
+                    summary.free_bytes_before.unwrap_or(0) as f64 / 1024.0 / 1024.0 / 1024.0,
+                    summary.free_bytes_after.unwrap_or(0) as f64 / 1024.0 / 1024.0 / 1024.0,
+                );
+            }
+            Ok(_) => {}
+            Err(err) => eprintln!("nas-fast-cache janitor failed: {err}"),
+        }
+        last_prune = Instant::now();
+
+        while rx.try_recv().is_ok() {}
+    }
 }
 
 impl CacheReadWindow {
@@ -423,6 +516,8 @@ fn thread_spawn_prefetch_worker(
 pub struct ReadThroughCache {
     config: CacheConfig,
     writer: CacheWriter,
+    maintainer: CacheMaintainer,
+    state: Arc<CacheRuntimeState>,
 }
 
 impl ReadThroughCache {
@@ -432,12 +527,18 @@ impl ReadThroughCache {
         } else {
             config.chunk_size
         };
+        let config = CacheConfig {
+            chunk_size,
+            ..config
+        };
+        let state = Arc::new(CacheRuntimeState::default());
+        let maintainer = CacheMaintainer::new(config.clone());
+        maintainer.request();
         Self {
-            config: CacheConfig {
-                chunk_size,
-                ..config
-            },
+            config,
             writer: CacheWriter::new(),
+            maintainer,
+            state,
         }
     }
 
@@ -548,6 +649,7 @@ impl ReadThroughCache {
         if offset >= meta.len {
             return Ok(CacheIoStats::default());
         }
+        self.note_access(meta)?;
 
         let mut copied = 0usize;
         let mut cursor = offset;
@@ -749,6 +851,10 @@ impl ReadThroughCache {
         remove_dir_if_exists(&self.config.cache_root)
     }
 
+    pub fn prune_once(&self) -> Result<PruneSummary> {
+        prune_cache(&self.config)
+    }
+
     fn load_chunk(
         &self,
         rel_path: &Path,
@@ -850,6 +956,10 @@ impl ReadThroughCache {
             .join(format!("{}.json", meta.cache_key))
     }
 
+    fn access_path(&self, meta: &SourceFileMeta) -> PathBuf {
+        access_path_for_key(&self.config.cache_root, &meta.cache_key)
+    }
+
     fn write_chunk_async(
         &self,
         meta: &SourceFileMeta,
@@ -866,6 +976,7 @@ impl ReadThroughCache {
         self.writer
             .write_atomic(final_path, bytes)
             .map_err(CacheError::Io)?;
+        self.maintainer.request();
         Ok(Some(len))
     }
 
@@ -884,6 +995,45 @@ impl ReadThroughCache {
             .map_err(CacheError::Io)?;
         Ok(Some(len))
     }
+
+    fn note_access(&self, meta: &SourceFileMeta) -> Result<()> {
+        if !self.config.pruning_enabled() {
+            return Ok(());
+        }
+
+        let now = Instant::now();
+        {
+            let mut touches = self
+                .state
+                .access_touches
+                .lock()
+                .map_err(|_| std::io::Error::other("access touch lock poisoned"))?;
+            if touches
+                .get(&meta.cache_key)
+                .map(|last| now.duration_since(*last) < ACCESS_TOUCH_INTERVAL)
+                .unwrap_or(false)
+            {
+                return Ok(());
+            }
+            touches.insert(meta.cache_key.clone(), now);
+        }
+
+        #[derive(Serialize)]
+        struct AccessTouch<'a> {
+            cache_key: &'a str,
+            rel_path: &'a str,
+            accessed_ns: u128,
+        }
+        let payload = serde_json::to_vec(&AccessTouch {
+            cache_key: &meta.cache_key,
+            rel_path: &meta.rel_path,
+            accessed_ns: system_time_ns(SystemTime::now()),
+        })?;
+        self.writer
+            .write_atomic_replace(self.access_path(meta), Arc::from(payload))
+            .map_err(CacheError::Io)?;
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -898,6 +1048,171 @@ pub struct DirEntryMeta {
 struct CachedChunk {
     bytes: Arc<[u8]>,
     stats: CacheIoStats,
+}
+
+#[derive(Debug, Default)]
+pub struct PruneSummary {
+    pub removed_entries: u64,
+    pub removed_bytes: u64,
+    pub cache_bytes_before: u64,
+    pub cache_bytes_after: u64,
+    pub free_bytes_before: Option<u64>,
+    pub free_bytes_after: Option<u64>,
+}
+
+pub fn prune_config(config: &CacheConfig) -> Result<PruneSummary> {
+    prune_cache(config)
+}
+
+#[derive(Debug)]
+struct CacheEntry {
+    cache_key: String,
+    chunk_dir: PathBuf,
+    meta_path: PathBuf,
+    access_path: PathBuf,
+    bytes: u64,
+    last_access: SystemTime,
+}
+
+fn prune_cache(config: &CacheConfig) -> Result<PruneSummary> {
+    let mut entries = scan_cache_entries(config)?;
+    entries.sort_by_key(|entry| entry.last_access);
+    let now = SystemTime::now();
+    let mut removed_keys = HashSet::new();
+    let mut removed_bytes = 0u64;
+    let cache_bytes_before = entries.iter().map(|entry| entry.bytes).sum::<u64>();
+    let free_bytes_before = available_space(&config.cache_root).ok();
+
+    if let Some(max_age) = config.max_cache_age {
+        for entry in &entries {
+            if removed_keys.contains(&entry.cache_key) {
+                continue;
+            }
+            if !older_than(now, entry.last_access, max_age.max(config.min_eviction_age)) {
+                continue;
+            }
+            let removed = remove_cache_entry(entry)?;
+            removed_keys.insert(entry.cache_key.clone());
+            removed_bytes += removed;
+        }
+    }
+
+    let mut cache_bytes_after_age = cache_bytes_before.saturating_sub(removed_bytes);
+    let free_after_age = free_bytes_before.map(|free| free.saturating_add(removed_bytes));
+    let mut bytes_to_remove = 0u64;
+
+    if let Some(max_cache_bytes) = config.max_cache_bytes {
+        bytes_to_remove =
+            bytes_to_remove.max(cache_bytes_after_age.saturating_sub(max_cache_bytes));
+    }
+    if let (Some(min_free_bytes), Some(free_bytes)) = (config.min_free_bytes, free_after_age) {
+        bytes_to_remove = bytes_to_remove.max(min_free_bytes.saturating_sub(free_bytes));
+    }
+
+    if bytes_to_remove > 0 {
+        let mut size_pressure_removed = 0u64;
+        for entry in &entries {
+            if size_pressure_removed >= bytes_to_remove {
+                break;
+            }
+            if removed_keys.contains(&entry.cache_key) {
+                continue;
+            }
+            if !older_than(now, entry.last_access, config.min_eviction_age) {
+                continue;
+            }
+            let removed = remove_cache_entry(entry)?;
+            removed_keys.insert(entry.cache_key.clone());
+            size_pressure_removed += removed;
+            removed_bytes += removed;
+        }
+        cache_bytes_after_age = cache_bytes_after_age.saturating_sub(size_pressure_removed);
+    }
+
+    Ok(PruneSummary {
+        removed_entries: removed_keys.len() as u64,
+        removed_bytes,
+        cache_bytes_before,
+        cache_bytes_after: cache_bytes_after_age,
+        free_bytes_before,
+        free_bytes_after: available_space(&config.cache_root).ok(),
+    })
+}
+
+fn scan_cache_entries(config: &CacheConfig) -> Result<Vec<CacheEntry>> {
+    let chunks_root = config.cache_root.join("chunks");
+    if !chunks_root.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut entries = Vec::new();
+    for prefix in fs::read_dir(chunks_root)? {
+        let prefix = prefix?;
+        if !prefix.metadata()?.is_dir() {
+            continue;
+        }
+        let prefix_name = prefix.file_name().to_string_lossy().to_string();
+        for entry in fs::read_dir(prefix.path())? {
+            let entry = entry?;
+            let metadata = entry.metadata()?;
+            if !metadata.is_dir() {
+                continue;
+            }
+            let cache_key = entry.file_name().to_string_lossy().to_string();
+            let meta_path = config
+                .cache_root
+                .join("meta")
+                .join(&prefix_name)
+                .join(format!("{cache_key}.json"));
+            let access_path = access_path_for_key(&config.cache_root, &cache_key);
+            let last_access = fs::metadata(&access_path)
+                .and_then(|metadata| metadata.modified())
+                .or_else(|_| fs::metadata(&meta_path).and_then(|metadata| metadata.modified()))
+                .or_else(|_| metadata.modified())
+                .unwrap_or(UNIX_EPOCH);
+            entries.push(CacheEntry {
+                cache_key,
+                chunk_dir: entry.path(),
+                meta_path,
+                access_path,
+                bytes: dir_size(&entry.path())?,
+                last_access,
+            });
+        }
+    }
+    Ok(entries)
+}
+
+fn remove_cache_entry(entry: &CacheEntry) -> Result<u64> {
+    let mut removed = remove_dir_if_exists(&entry.chunk_dir)?;
+    removed += remove_file_if_exists(&entry.meta_path)?;
+    removed += remove_file_if_exists(&entry.access_path)?;
+    Ok(removed.max(entry.bytes))
+}
+
+fn older_than(now: SystemTime, then: SystemTime, age: Duration) -> bool {
+    if age.is_zero() {
+        return true;
+    }
+    now.duration_since(then)
+        .map(|elapsed| elapsed >= age)
+        .unwrap_or(false)
+}
+
+fn available_space(path: &Path) -> std::io::Result<u64> {
+    let target = if path.exists() {
+        path
+    } else {
+        path.parent().unwrap_or(path)
+    };
+    fs2::available_space(target)
+}
+
+fn access_path_for_key(cache_root: &Path, cache_key: &str) -> PathBuf {
+    cache_root
+        .join("access")
+        .join(&cache_key[0..2])
+        .join(format!("{cache_key}.touch"))
 }
 
 #[derive(Clone)]
@@ -915,8 +1230,14 @@ impl CacheWriter {
                 let mut last_error: Option<String> = None;
                 for job in rx {
                     match job {
-                        WriteJob::Write { final_path, bytes } => {
-                            if let Err(err) = write_file_atomic(&final_path, &bytes, &mut nonce) {
+                        WriteJob::Write {
+                            final_path,
+                            bytes,
+                            replace,
+                        } => {
+                            if let Err(err) =
+                                write_file_atomic(&final_path, &bytes, &mut nonce, replace)
+                            {
                                 last_error = Some(err.to_string());
                             }
                         }
@@ -935,8 +1256,25 @@ impl CacheWriter {
     }
 
     fn write_atomic(&self, final_path: PathBuf, bytes: Arc<[u8]>) -> std::io::Result<()> {
+        self.write_job(final_path, bytes, false)
+    }
+
+    fn write_atomic_replace(&self, final_path: PathBuf, bytes: Arc<[u8]>) -> std::io::Result<()> {
+        self.write_job(final_path, bytes, true)
+    }
+
+    fn write_job(
+        &self,
+        final_path: PathBuf,
+        bytes: Arc<[u8]>,
+        replace: bool,
+    ) -> std::io::Result<()> {
         self.tx
-            .send(WriteJob::Write { final_path, bytes })
+            .send(WriteJob::Write {
+                final_path,
+                bytes,
+                replace,
+            })
             .map_err(|_| {
                 std::io::Error::new(std::io::ErrorKind::BrokenPipe, "cache writer stopped")
             })
@@ -957,14 +1295,20 @@ enum WriteJob {
     Write {
         final_path: PathBuf,
         bytes: Arc<[u8]>,
+        replace: bool,
     },
     Flush {
         done: Sender<std::io::Result<()>>,
     },
 }
 
-fn write_file_atomic(final_path: &Path, bytes: &[u8], nonce: &mut u64) -> std::io::Result<()> {
-    if final_path.exists() {
+fn write_file_atomic(
+    final_path: &Path,
+    bytes: &[u8],
+    nonce: &mut u64,
+    replace: bool,
+) -> std::io::Result<()> {
+    if !replace && final_path.exists() {
         return Ok(());
     }
     let parent = final_path.parent().expect("cache file has parent");
@@ -979,9 +1323,12 @@ fn write_file_atomic(final_path: &Path, bytes: &[u8], nonce: &mut u64) -> std::i
         tmp.write_all(bytes)?;
         tmp.sync_data()?;
     }
+    if replace {
+        let _ = fs::remove_file(final_path);
+    }
     match fs::rename(&tmp_path, final_path) {
         Ok(()) => Ok(()),
-        Err(err) if final_path.exists() => {
+        Err(err) if !replace && final_path.exists() => {
             let _ = fs::remove_file(&tmp_path);
             let _ = err;
             Ok(())
@@ -1124,5 +1471,47 @@ mod tests {
         assert_eq!(first.source_fetch_bytes, 1024 * 1024);
         assert!(!cache.join("chunks").exists());
         assert!(!cache.join("meta").exists());
+    }
+
+    #[test]
+    fn max_cache_size_prunes_oldest_cache_group() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source");
+        let cache = tmp.path().join("cache");
+        fs::create_dir_all(source.join("movies")).unwrap();
+        fs::write(
+            source.join("movies").join("a.bin"),
+            vec![1u8; 2 * 1024 * 1024],
+        )
+        .unwrap();
+        fs::write(
+            source.join("movies").join("b.bin"),
+            vec![2u8; 2 * 1024 * 1024],
+        )
+        .unwrap();
+
+        let mut config = CacheConfig::new(source.clone(), cache.clone());
+        config.chunk_size = 1024 * 1024;
+        let cache_engine = ReadThroughCache::new(config);
+        let mut sink = Vec::new();
+        cache_engine
+            .read_to_writer("movies/a.bin", None, &mut sink)
+            .unwrap();
+        cache_engine.flush_pending().unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        sink.clear();
+        cache_engine
+            .read_to_writer("movies/b.bin", None, &mut sink)
+            .unwrap();
+        cache_engine.flush_pending().unwrap();
+
+        let mut prune_config = CacheConfig::new(source, cache);
+        prune_config.chunk_size = 1024 * 1024;
+        prune_config.max_cache_bytes = Some(2 * 1024 * 1024);
+        let prune_engine = ReadThroughCache::new(prune_config);
+        let summary = prune_engine.prune_once().unwrap();
+
+        assert!(summary.removed_entries >= 1);
+        assert!(summary.cache_bytes_after <= 2 * 1024 * 1024);
     }
 }
