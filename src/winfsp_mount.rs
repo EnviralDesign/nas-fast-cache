@@ -618,12 +618,28 @@ impl FileSystemContext for ReadThroughFs {
     ) -> FspResult<FileSecurity> {
         let rel = path_from_winfsp(file_name)?;
         let source = fsp(self.cache.source_path(&rel))?;
-        let metadata = std::fs::metadata(source)?;
-        Ok(FileSecurity {
-            reparse: false,
-            sz_security_descriptor: 0,
-            attributes: attrs_for(metadata.is_dir(), !self.enable_writes),
-        })
+        match std::fs::metadata(source) {
+            Ok(metadata) => Ok(FileSecurity {
+                reparse: false,
+                sz_security_descriptor: 0,
+                attributes: attrs_for(metadata.is_dir(), !self.enable_writes),
+            }),
+            Err(err) if err.kind() == ErrorKind::NotFound && self.enable_writes => {
+                self.ensure_write_allowed(&rel)?;
+                let parent = rel.parent().unwrap_or_else(|| Path::new(""));
+                let parent_source = self.source_path_for_rel(parent)?;
+                let parent_metadata = std::fs::metadata(parent_source)?;
+                if !parent_metadata.is_dir() {
+                    return Err(Error::from(ErrorKind::NotFound).into());
+                }
+                Ok(FileSecurity {
+                    reparse: false,
+                    sz_security_descriptor: 0,
+                    attributes: FILE_ATTRIBUTE_NORMAL,
+                })
+            }
+            Err(err) => Err(err.into()),
+        }
     }
 
     fn open(

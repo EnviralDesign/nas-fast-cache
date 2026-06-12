@@ -83,6 +83,30 @@ scripts\start-nas-fast-cache.ps1 `
   -Background
 ```
 
+## Windows Service
+
+For a first-class persistent mount, install the foreground mount command under
+NSSM from an elevated shell:
+
+```powershell
+scripts\install-service.ps1 `
+  -ServiceName NasFastCache `
+  -ConfigPath config\local.ps1 `
+  -NssmPath 'C:\path\to\nssm.exe'
+```
+
+Inspect the exact commands without changing anything:
+
+```powershell
+scripts\install-service.ps1 -NssmPath 'C:\path\to\nssm.exe' -DryRun
+```
+
+Remove the service:
+
+```powershell
+scripts\remove-service.ps1 -ServiceName NasFastCache -NssmPath 'C:\path\to\nssm.exe'
+```
+
 ## Benchmark
 
 Use a large file under the source root:
