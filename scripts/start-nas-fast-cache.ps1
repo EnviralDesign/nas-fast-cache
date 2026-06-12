@@ -17,6 +17,10 @@ param(
 
 $ErrorActionPreference = "Stop"
 $repoRoot = Split-Path -Parent $PSScriptRoot
+$explicitParameters = @{}
+foreach ($key in $PSBoundParameters.Keys) {
+    $explicitParameters[$key] = $PSBoundParameters[$key]
+}
 
 if ($ConfigPath) {
     $resolvedConfig = if ([System.IO.Path]::IsPathRooted($ConfigPath)) {
@@ -33,6 +37,10 @@ if ($ConfigPath) {
     if (Test-Path $defaultConfig) {
         . $defaultConfig
     }
+}
+
+foreach ($key in $explicitParameters.Keys) {
+    Set-Variable -Name $key -Value $explicitParameters[$key]
 }
 
 if (-not $SourceRoot) { $SourceRoot = $env:NAS_FAST_CACHE_SOURCE_ROOT }
