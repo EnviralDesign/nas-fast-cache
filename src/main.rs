@@ -103,6 +103,8 @@ enum Command {
         write_prefix: Option<PathBuf>,
         #[arg(long)]
         reuse_write_handles: bool,
+        #[arg(long)]
+        flush_and_purge_on_cleanup: bool,
         #[command(flatten)]
         cache_policy: CachePolicyArgs,
     },
@@ -249,6 +251,7 @@ fn main() -> Result<()> {
             enable_writes,
             write_prefix,
             reuse_write_handles,
+            flush_and_purge_on_cleanup,
             cache_policy,
         } => mount(
             source_root,
@@ -261,6 +264,7 @@ fn main() -> Result<()> {
             enable_writes,
             write_prefix,
             reuse_write_handles,
+            flush_and_purge_on_cleanup,
             cache_policy,
         )?,
         Command::Prune {
@@ -388,6 +392,7 @@ fn mount(
     enable_writes: bool,
     write_prefix: Option<PathBuf>,
     reuse_write_handles: bool,
+    flush_and_purge_on_cleanup: bool,
     cache_policy: CachePolicyArgs,
 ) -> Result<()> {
     use nas_cache::pathing::normalize_relative_path;
@@ -415,7 +420,8 @@ fn mount(
             threads,
             enable_writes,
             write_prefix,
-            reuse_write_handles,
+            reuse_write_handles: reuse_write_handles || enable_writes,
+            flush_and_purge_on_cleanup,
         },
     )
     .map_err(|err| anyhow::anyhow!("failed to mount WinFsp filesystem: {err:?}"))
@@ -433,6 +439,7 @@ fn mount(
     _enable_writes: bool,
     _write_prefix: Option<PathBuf>,
     _reuse_write_handles: bool,
+    _flush_and_purge_on_cleanup: bool,
     _cache_policy: CachePolicyArgs,
 ) -> Result<()> {
     bail!("mount support is only available on Windows with the `mount` feature enabled")

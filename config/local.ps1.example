@@ -25,5 +25,6 @@ $EnableWrites = $false
 # writes when this is intended to replace a normal mapped share.
 $WritePrefix = ""
 $ReuseWriteHandles = $false
+$FlushAndPurgeOnCleanup = $false
 
 $WinFspBin = "C:\Program Files (x86)\WinFsp\bin"

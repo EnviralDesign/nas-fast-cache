@@ -63,6 +63,11 @@ Optional values:
 - `$WritePrefix`: required when writes are enabled; set a subdirectory for scoped
   writes or `.` to explicitly allow writes across the whole source tree.
 - `$ReuseWriteHandles`: keeps backing source write handles open across callbacks.
+  Write-enabled mounts keep handles open even when this is omitted, which avoids
+  NAS open/write/close churn.
+- `$FlushAndPurgeOnCleanup`: asks WinFsp to flush and purge cached file data on
+  cleanup. This is off by default because write-heavy workloads can otherwise
+  accumulate fast cached writes and then stall at close.
 
 ## Mount
 

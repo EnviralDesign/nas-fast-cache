@@ -43,6 +43,7 @@ pub fn mount_readonly(cache: ReadThroughCache, mount: &str, threads: u32) -> any
             enable_writes: false,
             write_prefix: None,
             reuse_write_handles: false,
+            flush_and_purge_on_cleanup: false,
         },
     )
 }
@@ -52,6 +53,7 @@ pub struct MountOptions {
     pub enable_writes: bool,
     pub write_prefix: Option<PathBuf>,
     pub reuse_write_handles: bool,
+    pub flush_and_purge_on_cleanup: bool,
 }
 
 pub fn mount_with_options(
@@ -74,7 +76,7 @@ pub fn mount_with_options(
         .volume_info_timeout(30_000)
         .security_timeout(u32::MAX)
         .post_cleanup_when_modified_only(true)
-        .flush_and_purge_on_cleanup(true);
+        .flush_and_purge_on_cleanup(mount_options.flush_and_purge_on_cleanup);
 
     let threads = mount_options.threads;
     let enable_writes = mount_options.enable_writes;
@@ -662,6 +664,7 @@ impl FileSystemContext for ReadThroughFs {
             metadata.modified().ok(),
             !self.enable_writes,
         );
+        set_normalized_name(file_info, file_name);
         if metadata.is_dir() {
             Ok(Handle::Directory {
                 rel: Mutex::new(rel),
@@ -722,6 +725,7 @@ impl FileSystemContext for ReadThroughFs {
                 metadata.modified().ok(),
                 false,
             );
+            set_normalized_name(file_info, file_name);
             Ok(Handle::Directory {
                 rel: Mutex::new(rel),
                 buffer: DirBuffer::new(),
@@ -743,6 +747,7 @@ impl FileSystemContext for ReadThroughFs {
                 Some(ns_to_system_time(meta.modified_ns)),
                 false,
             );
+            set_normalized_name(file_info, file_name);
             Ok(Handle::File {
                 rel: Mutex::new(rel),
                 meta: Mutex::new(meta),
@@ -828,11 +833,7 @@ impl FileSystemContext for ReadThroughFs {
     ) -> FspResult<()> {
         match context {
             Some(Handle::File {
-                rel,
-                meta,
-                write_file,
-                dirty_original_meta,
-                ..
+                meta, write_file, ..
             }) => {
                 let mut file = write_file
                     .lock()
@@ -843,7 +844,10 @@ impl FileSystemContext for ReadThroughFs {
                 if !self.reuse_write_handles {
                     *file = None;
                 }
-                self.finish_file_mutation(rel, meta, dirty_original_meta, Some(file_info))?;
+                let meta = meta
+                    .lock()
+                    .map_err(|_| Error::other("file metadata lock poisoned"))?;
+                fill_info_from_meta(file_info, &meta, !self.enable_writes);
             }
             Some(Handle::Directory { rel, .. }) => {
                 self.fill_info_for_rel(rel, true, file_info)?;
@@ -1278,6 +1282,14 @@ fn fsp<T>(result: crate::cache::Result<T>) -> FspResult<T> {
         CacheError::Json(_) => Error::from(ErrorKind::InvalidData).into(),
         CacheError::OffsetBeyondEof { .. } => Error::from(ErrorKind::InvalidInput).into(),
     })
+}
+
+fn set_normalized_name(file_info: &mut OpenFileInfo, file_name: &U16CStr) {
+    let normalized = file_name
+        .to_string_lossy()
+        .encode_utf16()
+        .collect::<Vec<_>>();
+    file_info.set_normalized_name(&normalized, Some('\\' as u16));
 }
 
 fn maybe_spawn_stats_reporter(stats: Arc<MountStats>) {

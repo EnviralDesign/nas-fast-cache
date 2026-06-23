@@ -17,6 +17,7 @@ param(
     [switch]$EnableWrites,
     [string]$WritePrefix = "",
     [switch]$ReuseWriteHandles,
+    [switch]$FlushAndPurgeOnCleanup,
     [switch]$Background
 )
 
@@ -108,6 +109,7 @@ if ($EnableWrites) {
     $args += $WritePrefix
 }
 if ($ReuseWriteHandles) { $args += "--reuse-write-handles" }
+if ($FlushAndPurgeOnCleanup) { $args += "--flush-and-purge-on-cleanup" }
 
 if ($Background) {
     $logDir = Join-Path $repoRoot "logs"
