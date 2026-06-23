@@ -4,6 +4,10 @@
 $SourceRoot = "\\nas-host\share"
 $CacheRoot = "C:\path\to\nas-fast-cache"
 $Mount = "W:"
+# Register drive letters through Windows Mount Manager. This needs elevation,
+# creates a global drive, and fixes Windows APIs that require DOS/GUID volume
+# names, such as Python Path.resolve() on WinFsp drives.
+$UseMountManager = $false
 
 $Threads = 8
 $ChunkSizeMiB = 8

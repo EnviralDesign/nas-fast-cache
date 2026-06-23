@@ -58,6 +58,10 @@ Optional values:
 - `$MinEvictionAgeHours`: protect recently accessed cache groups from automatic
   size/free-space pruning. `24` is a conservative starting point.
 - `$PruneIntervalSeconds`: janitor wake interval. `300` gives a 5-minute cadence.
+- `$UseMountManager`: register drive-letter mounts through Windows Mount Manager.
+  This requires elevation and creates a global drive, but fixes Windows APIs
+  that require DOS/GUID volume names, including Python `Path.resolve()` calls on
+  the mounted drive.
 - `$EnableSequentialConveyor`: enables sequential read prefetching.
 - `$EnableWrites`: enables writes through the mount.
 - `$WritePrefix`: required when writes are enabled; set a subdirectory for scoped
@@ -76,6 +80,10 @@ scripts\start-nas-fast-cache.ps1 -ConfigPath config\local.ps1 -Background
 ```
 
 The helper writes logs under `logs/` when started in the background.
+
+When `$UseMountManager = $true`, keep `$Mount` as a normal drive letter such as
+`W:`. The wrapper passes WinFsp's special `\\.\W:` mount specification
+internally; do not put that special syntax in local config.
 
 Stop the mount:
 

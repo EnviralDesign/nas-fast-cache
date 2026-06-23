@@ -44,6 +44,7 @@ pub fn mount_readonly(cache: ReadThroughCache, mount: &str, threads: u32) -> any
             write_prefix: None,
             reuse_write_handles: false,
             flush_and_purge_on_cleanup: false,
+            use_mount_manager: false,
         },
     )
 }
@@ -54,6 +55,7 @@ pub struct MountOptions {
     pub write_prefix: Option<PathBuf>,
     pub reuse_write_handles: bool,
     pub flush_and_purge_on_cleanup: bool,
+    pub use_mount_manager: bool,
 }
 
 pub fn mount_with_options(
@@ -62,6 +64,15 @@ pub fn mount_with_options(
     mount_options: MountOptions,
 ) -> anyhow::Result<()> {
     winfsp::winfsp_init_or_die();
+    let MountOptions {
+        threads,
+        enable_writes,
+        write_prefix,
+        reuse_write_handles,
+        flush_and_purge_on_cleanup,
+        use_mount_manager,
+    } = mount_options;
+
     let mut volume = VolumeParams::new();
     volume
         .filesystem_name("NasCache")
@@ -76,12 +87,8 @@ pub fn mount_with_options(
         .volume_info_timeout(30_000)
         .security_timeout(u32::MAX)
         .post_cleanup_when_modified_only(true)
-        .flush_and_purge_on_cleanup(mount_options.flush_and_purge_on_cleanup);
+        .flush_and_purge_on_cleanup(flush_and_purge_on_cleanup);
 
-    let threads = mount_options.threads;
-    let enable_writes = mount_options.enable_writes;
-    let write_prefix = mount_options.write_prefix;
-    let reuse_write_handles = mount_options.reuse_write_handles;
     let options = FileSystemParams::default_params(volume);
     let stats = Arc::new(MountStats::default());
     maybe_spawn_stats_reporter(Arc::clone(&stats));
@@ -95,7 +102,8 @@ pub fn mount_with_options(
     };
     let mut host: FileSystemHost<ReadThroughFs, FineGuard> =
         FileSystemHost::new_with_options(options, context)?;
-    host.mount(mount.to_string())?;
+    let mount_spec = build_winfsp_mount_spec(mount, use_mount_manager)?;
+    host.mount(mount_spec)?;
     eprintln!("nas-fast-cache mounted at {mount}; press Ctrl+C or stop the process to unmount");
     host.start_with_threads(threads)?;
     let running = Arc::new(AtomicBool::new(true));
@@ -109,6 +117,22 @@ pub fn mount_with_options(
     host.stop();
     host.unmount();
     Ok(())
+}
+
+fn build_winfsp_mount_spec(mount: &str, use_mount_manager: bool) -> anyhow::Result<String> {
+    let mount = mount.trim();
+    if !use_mount_manager {
+        return Ok(mount.to_owned());
+    }
+
+    let bytes = mount.as_bytes();
+    anyhow::ensure!(
+        bytes.len() == 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':',
+        "Mount Manager mode requires a drive letter such as Z:"
+    );
+
+    let drive = (bytes[0] as char).to_ascii_uppercase();
+    Ok(format!(r"\\.\{drive}:"))
 }
 
 struct ReadThroughFs {
@@ -1512,4 +1536,41 @@ fn system_time_ns(time: SystemTime) -> u128 {
     time.duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_winfsp_mount_spec;
+
+    #[test]
+    fn mount_spec_keeps_plain_mount_when_mount_manager_disabled() {
+        assert_eq!(
+            build_winfsp_mount_spec("Z:", false).unwrap(),
+            "Z:".to_string()
+        );
+        assert_eq!(
+            build_winfsp_mount_spec(r"\\server\share", false).unwrap(),
+            r"\\server\share".to_string()
+        );
+    }
+
+    #[test]
+    fn mount_spec_uses_mount_manager_drive_syntax() {
+        assert_eq!(
+            build_winfsp_mount_spec("z:", true).unwrap(),
+            r"\\.\Z:".to_string()
+        );
+        assert_eq!(
+            build_winfsp_mount_spec(" Q: ", true).unwrap(),
+            r"\\.\Q:".to_string()
+        );
+    }
+
+    #[test]
+    fn mount_manager_rejects_non_drive_letter_mounts() {
+        assert!(build_winfsp_mount_spec(r"\\server\share", true).is_err());
+        assert!(build_winfsp_mount_spec(r"\\.\Z:", true).is_err());
+        assert!(build_winfsp_mount_spec("Z:\\", true).is_err());
+        assert!(build_winfsp_mount_spec("1:", true).is_err());
+    }
 }

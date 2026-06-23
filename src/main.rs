@@ -105,6 +105,12 @@ enum Command {
         reuse_write_handles: bool,
         #[arg(long)]
         flush_and_purge_on_cleanup: bool,
+        /// Register drive-letter mounts through Windows Mount Manager.
+        ///
+        /// This requires elevation and creates a global drive, but enables
+        /// Windows DOS/GUID final-path APIs such as Path.resolve().
+        #[arg(long)]
+        mount_manager: bool,
         #[command(flatten)]
         cache_policy: CachePolicyArgs,
     },
@@ -252,6 +258,7 @@ fn main() -> Result<()> {
             write_prefix,
             reuse_write_handles,
             flush_and_purge_on_cleanup,
+            mount_manager,
             cache_policy,
         } => mount(
             source_root,
@@ -265,6 +272,7 @@ fn main() -> Result<()> {
             write_prefix,
             reuse_write_handles,
             flush_and_purge_on_cleanup,
+            mount_manager,
             cache_policy,
         )?,
         Command::Prune {
@@ -393,6 +401,7 @@ fn mount(
     write_prefix: Option<PathBuf>,
     reuse_write_handles: bool,
     flush_and_purge_on_cleanup: bool,
+    mount_manager: bool,
     cache_policy: CachePolicyArgs,
 ) -> Result<()> {
     use nas_cache::pathing::normalize_relative_path;
@@ -422,6 +431,7 @@ fn mount(
             write_prefix,
             reuse_write_handles: reuse_write_handles || enable_writes,
             flush_and_purge_on_cleanup,
+            use_mount_manager: mount_manager,
         },
     )
     .map_err(|err| anyhow::anyhow!("failed to mount WinFsp filesystem: {err:?}"))
@@ -440,6 +450,7 @@ fn mount(
     _write_prefix: Option<PathBuf>,
     _reuse_write_handles: bool,
     _flush_and_purge_on_cleanup: bool,
+    _mount_manager: bool,
     _cache_policy: CachePolicyArgs,
 ) -> Result<()> {
     bail!("mount support is only available on Windows with the `mount` feature enabled")

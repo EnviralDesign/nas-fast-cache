@@ -18,6 +18,7 @@ param(
     [string]$WritePrefix = "",
     [switch]$ReuseWriteHandles,
     [switch]$FlushAndPurgeOnCleanup,
+    [switch]$UseMountManager,
     [switch]$Background
 )
 
@@ -63,6 +64,13 @@ if (-not $CacheRoot) { throw "CacheRoot is required. Use -CacheRoot, config/loca
 if (-not $Mount) { throw "Mount is required. Use -Mount, config/local.ps1, or NAS_FAST_CACHE_MOUNT." }
 if ($EnableWrites -and -not $WritePrefix) {
     throw "-EnableWrites requires -WritePrefix to keep write scope explicit."
+}
+if ($UseMountManager) {
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = [Security.Principal.WindowsPrincipal]::new($identity)
+    if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+        throw "Mount Manager mode requires an elevated process."
+    }
 }
 
 $exe = Join-Path $repoRoot "target\release\nas-fast-cache.exe"
@@ -110,6 +118,7 @@ if ($EnableWrites) {
 }
 if ($ReuseWriteHandles) { $args += "--reuse-write-handles" }
 if ($FlushAndPurgeOnCleanup) { $args += "--flush-and-purge-on-cleanup" }
+if ($UseMountManager) { $args += "--mount-manager" }
 
 if ($Background) {
     $logDir = Join-Path $repoRoot "logs"
